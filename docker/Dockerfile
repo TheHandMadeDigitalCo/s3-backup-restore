@@ -4,9 +4,17 @@ WORKDIR "/app"
 
 COPY . .
 
-RUN go build -o /bin/s3-backup-restore cmd/s3-backup-restore/main.go
+# Create appuser
+ENV GOOS=linux 
+ENV GOARCH=amd64 
+ENV GO111MODULE=on
 
-FROM gcr.io/distroless/base-debian10
+RUN update-ca-certificates && \
+    go mod download && \
+    go mod verify && \
+    CGO_ENABLED=0 go build -ldflags='-w -s -extldflags "-static"' -a -o /bin/s3-backup-restore cmd/s3-backup-restore/main.go
+
+FROM gcr.io/distroless/static
 
 COPY --from=builder /bin/s3-backup-restore /bin/s3-backup-restore
 
