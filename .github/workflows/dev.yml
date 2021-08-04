@@ -1,0 +1,38 @@
+name: "Distribute Debug Build"
+
+on:
+  push:
+    tags:
+      - 'dev/**'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  dev-release:
+    name: Create Dev Release
+
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+
+    steps:
+      - name: "Checkout Source"
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: "Log into registry"
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin  
+
+      - name: "Build Image"
+        run: |
+          VERSION=$(cat VERSION)
+          OWNER=$(echo ${{ github.repository_owner }} | awk '{print tolower($0)}')
+          echo "Version: ${VERSION}-${{ github.sha }}"
+          docker build -f docker/Dockerfile -t ghcr.io/${OWNER}/s3br:${VERSION}-${{ github.sha }} .
+          docker build --build-arg TAG=debug-nonroot -f docker/Dockerfile -t ghcr.io/${OWNER}/s3br:${VERSION}-DEBUG-${{ github.sha }} .
+          docker push ghcr.io/${OWNER}/s3br:${VERSION}-${{ github.sha }} 
+          docker push ghcr.io/${OWNER}/s3br:${VERSION}-DEBUG-${{ github.sha }} 
