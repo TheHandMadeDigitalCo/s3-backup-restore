@@ -39,40 +39,72 @@ func (b Backup) Run(backupType string) {
 	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 
 	log.Info("Compressing directory")
-	archivePath := b.compressDirectory(now, backupType)
+	archivePath, err := b.compressDirectory(now, backupType)
+
+	if err != nil {
+		log.Errorf("failed to compress directory: error = %s", err)
+		return
+	}
 
 	log.Info("Uploading to S3")
-	b.uploadToS3(now, backupType, archivePath)
+	if err = b.uploadToS3(now, backupType, archivePath); err != nil {
+		log.Errorf("failed to upload to S3: error = %s", err)
+		return
+	}
 
 	log.Info("Pruning old backups from S3")
-	b.pruneS3(backupType)
+	if err = b.pruneS3(backupType); err != nil {
+		// report but carry on anyway
+		log.Errorf("failed to prune old backups from S3: error = %s", err)
+	}
 
 	log.Info("Removing temporary backup directory")
-	b.removeBackupDirectory()
+	if err = b.removeBackupDirectory(); err != nil {
+		log.Warnf("failed to delete backup directory: error = %s", err)
+	}
+
 	log.Info("Backup complete")
 }
 
-func (b Backup) compressDirectory(now string, backupType string) string {
+func (b Backup) compressDirectory(now string, backupType string) (string, error) {
 	backupFile, err := os.OpenFile(b.DataDirectory+"/BACKUP_DATE", os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
-		log.Fatal(err)
+		return "", err
 	}
 
-	backupFile.WriteString(fmt.Sprintf("%s/%s\n", backupType, now))
+	_, err = backupFile.WriteString(fmt.Sprintf("%s/%s\n", backupType, now))
+	if err != nil {
+		return "", err
+	}
 
 	tempDir := os.TempDir() + "/backups"
-	os.Mkdir(tempDir, 0700)
+	err = os.Mkdir(tempDir, 0700)
+	if err != nil {
+		return "", err
+	}
 	file, err := ioutil.TempFile(tempDir, "backup*.tar.gz")
 	if err != nil {
-		log.Fatalln(err)
+		return "", err
 	}
-	defer file.Close()
+	defer func(file *os.File) {
+		if err := file.Close(); err != nil {
+			log.Warnf("failed to close of backup temp file: error = %s", err)
+		}
+	}(file)
 
 	gw := gzip.NewWriter(file)
-	defer gw.Close()
+	defer func(gw *gzip.Writer) {
+		if err := gw.Close(); err != nil {
+			log.Warnf("failed to close gzip writer for backup: %s", err)
+		}
+	}(gw)
 
 	tw := tar.NewWriter(gw)
-	defer tw.Close()
+	defer func(tw *tar.Writer) {
+		if err := tw.Close(); err != nil {
+			log.Warnf("failed to close tar writer for backup: %s", err)
+		}
+	}(tw)
 
 	err = filepath.Walk(
 		b.DataDirectory,
@@ -95,27 +127,28 @@ func (b Backup) compressDirectory(now string, backupType string) string {
 	)
 
 	if err != nil {
-		log.Println(err)
+		return "", err
 	}
 
-	log.Debugf("Output file: %s", file.Name())
-	log.Info("Archive created successfully")
-	return file.Name()
+	log.Infof("Archive created successfully: output file = %s", file.Name())
+	return file.Name(), nil
 }
 
-func (b Backup) uploadToS3(now string, backupType string, path string) {
+func (b Backup) uploadToS3(now string, backupType string, path string) error {
 	uploader := s3manager.NewUploader(b.AwsSession)
 	file, err := os.Open(path)
 	if err != nil {
-		log.Fatal("Unable to open archive: ", path)
+		return err
 	}
-	defer file.Close()
-
-	log.Debugf("Output path: %s", path)
+	defer func(file *os.File) {
+		if err := file.Close(); err != nil {
+			log.Warnf("failed to close S3 upload file: file = %s, error = %s", path, err)
+		}
+	}(file)
 
 	uploadPath := fmt.Sprintf("%s/%s/%s.tar.gz", b.S3Path, backupType, now)
 
-	log.Debugf("Uploading to %s", uploadPath)
+	log.Infof("Uploading to backup file: key = %s", uploadPath)
 
 	uploadInput := s3manager.UploadInput{
 		Body:   file,
@@ -125,13 +158,14 @@ func (b Backup) uploadToS3(now string, backupType string, path string) {
 
 	_, err = uploader.Upload(&uploadInput)
 	if err != nil {
-		log.Fatal("Unable to upload", err)
+		return err
 	}
 
-	log.Info("Uploaded backup successfully")
+	log.Info("Uploaded backup successfully: file = %s, key = %s", path, uploadPath)
+	return nil
 }
 
-func (b Backup) pruneS3(backupType string) {
+func (b Backup) pruneS3(backupType string) error {
 	objects := b.getBucketObjects(backupType)
 	var keys []string
 	for _, o := range objects {
@@ -152,7 +186,7 @@ func (b Backup) pruneS3(backupType string) {
 
 	if len(keys) <= numberToKeep {
 		log.Debug("Nothing to prune, skipping.")
-		return
+		return nil
 	}
 
 	var deleteObjects []s3manager.BatchDeleteObject
@@ -166,23 +200,19 @@ func (b Backup) pruneS3(backupType string) {
 	}
 
 	batcher := s3manager.NewBatchDeleteWithClient(b.S3Service)
-	err := batcher.Delete(aws.BackgroundContext(), &s3manager.DeleteObjectsIterator{
+	if err := batcher.Delete(aws.BackgroundContext(), &s3manager.DeleteObjectsIterator{
 		Objects: deleteObjects,
-	})
-
-	if err != nil {
-		log.Fatal("Unable to delete old", err)
+	}); err != nil {
+		return err
 	}
 
 	log.Info("S3 backups pruned successfully")
+	return nil
 }
 
-func (b Backup) removeBackupDirectory() {
+func (b Backup) removeBackupDirectory() error {
 	dir := os.TempDir() + "/backups"
-	err := os.RemoveAll(dir)
-	if err != nil {
-		log.Fatal("Unable to remove temp files")
-	}
+	return os.RemoveAll(dir)
 }
 
 func (b Backup) getBucketObjects(backupType string) []*s3.Object {
@@ -204,7 +234,11 @@ func (b Backup) addFile(tw *tar.Writer, path string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func(file *os.File) {
+		if err := file.Close(); err != nil {
+			log.Warnf("failed to close file as part of tar creation: error = %s", err)
+		}
+	}(file)
 
 	if stat, err := file.Stat(); err == nil {
 		header, err := tar.FileInfoHeader(stat, path)
